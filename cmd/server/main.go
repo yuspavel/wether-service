@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-co-op/gocron/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/yussup/wether-service/internal/client/http/geocoding"
 	"github.com/yussup/wether-service/internal/client/http/openmeteo"
 )
@@ -21,37 +23,34 @@ const (
 )
 
 type Measure struct {
-	Timestamp   time.Time
-	Temperature float64
-}
-
-type Storage struct {
-	data map[string][]Measure
-	mu   sync.RWMutex
+	Name        string    `db:"name"`
+	Timestamp   time.Time `db:"timestamp"`
+	Temperature float64   `db:"temperature"`
 }
 
 func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
+	ctx := context.Background()
 
-	storage := &Storage{
-		data: make(map[string][]Measure),
+	conn, err := pgx.Connect(ctx, "postgresql://yuspavel:qwerty123@localhost:54321/wether")
+	if err != nil {
+		panic(err)
 	}
+	defer conn.Close(context.Background())
+
 	r.Get("/{city}", func(w http.ResponseWriter, r *http.Request) {
 		cityName := chi.URLParam(r, "city")
 		fmt.Println("City:", cityName)
 
-		storage.mu.RLock()
-		defer storage.mu.RUnlock()
-
-		c, ok := storage.data[cityName]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte("note found"))
-			return
+		var measure Measure
+		err = conn.QueryRow(ctx, "select name,timestamp,temperature from measures where name=$1 order by timestamp desc limit 5", city).Scan(&measure.Name, &measure.Timestamp, &measure.Temperature)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("internal error"))
 		}
 
-		b, err := json.Marshal(c)
+		b, err := json.Marshal(measure)
 		if err != nil {
 			log.Println(err)
 			return
@@ -64,12 +63,12 @@ func main() {
 
 	})
 
-	s, err := gocron.NewScheduler()
+	scheduler, err := gocron.NewScheduler()
 	if err != nil {
 		panic(err)
 	}
 
-	jobs, err := initJobs(s, storage)
+	jobs, err := initJobs(ctx, scheduler, conn)
 	if err != nil {
 		panic(err)
 	}
@@ -89,13 +88,13 @@ func main() {
 	go func() {
 		defer wg.Done()
 		fmt.Printf("starting job #%v\n", jobs[0].ID())
-		s.Start()
+		scheduler.Start()
 	}()
 
 	wg.Wait()
 }
 
-func initJobs(scheduler gocron.Scheduler, s *Storage) ([]gocron.Job, error) {
+func initJobs(ctx context.Context, scheduler gocron.Scheduler, conn *pgx.Conn) ([]gocron.Job, error) {
 
 	job, err := scheduler.NewJob(
 		gocron.DurationJob(
@@ -104,7 +103,7 @@ func initJobs(scheduler gocron.Scheduler, s *Storage) ([]gocron.Job, error) {
 		gocron.NewTask(
 			func() {
 				httpClient := &http.Client{
-					Timeout: 10 * time.Second,
+					Timeout: 5 * time.Second,
 				}
 
 				geocodingClient := geocoding.NewClient(httpClient)
@@ -121,16 +120,18 @@ func initJobs(scheduler gocron.Scheduler, s *Storage) ([]gocron.Job, error) {
 					return
 				}
 
-				s.mu.Lock()
-				defer s.mu.Unlock()
 				timestamp, err := time.Parse("2006-01-02T15:04", openResp.Current.Time)
 				if err != nil {
 					log.Println(err)
 					return
 				}
-				s.data[city] = append(s.data[city], Measure{Timestamp: timestamp, Temperature: openResp.Current.Temperature2m})
 
-				fmt.Printf("%v: uploaded data for city: %s", timestamp, city)
+				_, err = conn.Exec(ctx, "INSERT INTO measures (name,timestamp,temperature) VALUES ($1,$2,$3)", city, timestamp, openResp.Current.Temperature2m)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				fmt.Printf("%v: uploaded data for city: %s\n", timestamp, city)
 			},
 		),
 	)
