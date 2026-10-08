@@ -15,33 +15,43 @@ import (
 	"github.com/yussup/wether-service/internal/client/http/openmeteo"
 )
 
-const httpPort = ":3000"
+const (
+	httpPort = ":3000"
+	city     = "moscow"
+)
+
+type Measure struct {
+	Timestamp   time.Time
+	Temperature float64
+}
+
+type Storage struct {
+	data map[string][]Measure
+	mu   sync.RWMutex
+}
 
 func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
+
+	storage := &Storage{
+		data: make(map[string][]Measure),
 	}
-
-	geocodingClient := geocoding.NewClient(httpClient)
-	openmeteoClient := openmeteo.NewClient(httpClient)
-
 	r.Get("/{city}", func(w http.ResponseWriter, r *http.Request) {
-		city := chi.URLParam(r, "city")
-		fmt.Println("City:", city)
-		geoResp, err := geocodingClient.GetCoords(city)
-		if err != nil {
-			log.Println(err)
+		cityName := chi.URLParam(r, "city")
+		fmt.Println("City:", cityName)
+
+		storage.mu.RLock()
+		defer storage.mu.RUnlock()
+
+		c, ok := storage.data[cityName]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("note found"))
 			return
 		}
 
-		openResp, err := openmeteoClient.GetTemperature(geoResp.Latitude, geoResp.Longitude)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		b, err := json.Marshal(openResp)
+		b, err := json.Marshal(c)
 		if err != nil {
 			log.Println(err)
 			return
@@ -59,7 +69,7 @@ func main() {
 		panic(err)
 	}
 
-	jobs, err := initJobs(s)
+	jobs, err := initJobs(s, storage)
 	if err != nil {
 		panic(err)
 	}
@@ -85,15 +95,42 @@ func main() {
 	wg.Wait()
 }
 
-func initJobs(scheduler gocron.Scheduler) ([]gocron.Job, error) {
+func initJobs(scheduler gocron.Scheduler, s *Storage) ([]gocron.Job, error) {
 
-	j, err := scheduler.NewJob(
+	job, err := scheduler.NewJob(
 		gocron.DurationJob(
 			10*time.Second,
 		),
 		gocron.NewTask(
 			func() {
-				fmt.Println("cron print") // do things
+				httpClient := &http.Client{
+					Timeout: 10 * time.Second,
+				}
+
+				geocodingClient := geocoding.NewClient(httpClient)
+				openmeteoClient := openmeteo.NewClient(httpClient)
+				geoResp, err := geocodingClient.GetCoords(city)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				openResp, err := openmeteoClient.GetTemperature(geoResp.Latitude, geoResp.Longitude)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				timestamp, err := time.Parse("2006-01-02T15:04", openResp.Current.Time)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				s.data[city] = append(s.data[city], Measure{Timestamp: timestamp, Temperature: openResp.Current.Temperature2m})
+
+				fmt.Printf("%v: uploaded data for city: %s", timestamp, city)
 			},
 		),
 	)
@@ -101,5 +138,5 @@ func initJobs(scheduler gocron.Scheduler) ([]gocron.Job, error) {
 		return nil, err
 	}
 
-	return []gocron.Job{j}, nil
+	return []gocron.Job{job}, nil
 }
