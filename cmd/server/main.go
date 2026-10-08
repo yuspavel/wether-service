@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -44,20 +45,30 @@ func main() {
 		fmt.Println("City:", cityName)
 
 		var measure Measure
-		err = conn.QueryRow(ctx, "select name,timestamp,temperature from measures where name=$1 order by timestamp desc limit 5", city).Scan(&measure.Name, &measure.Timestamp, &measure.Temperature)
+		err = conn.QueryRow(ctx, "select name,timestamp,temperature from measures where name=$1 order by timestamp desc limit 5", cityName).Scan(&measure.Name, &measure.Timestamp, &measure.Temperature)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(fmt.Appendf(nil, "%s not found", cityName)))
+				return
+			}
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte("internal error"))
+			return
 		}
 
 		b, err := json.Marshal(measure)
 		if err != nil {
 			log.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("internal error"))
 			return
 		}
 
 		if _, err = w.Write(b); err != nil {
 			log.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("internal error"))
 			return
 		}
 
